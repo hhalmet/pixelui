@@ -27,7 +27,7 @@ func (ui *UI) loadFont() {
 	ui.fontAtlas = ui.win.MakePicture(pic)
 
 	data := pixel.NewSprite(pic, pic.Bounds()).Picture().(*pixel.PictureData).Image()
-	id := ui.nextID()
+	id := ui.nextSpriteId()
 	ui.fontId = id
 	ui.packer.Insert(id, data)
 	ui.fonts.SetTextureID(imgui.TextureID(id))

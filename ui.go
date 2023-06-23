@@ -46,23 +46,38 @@ void main() {
 
 // UI Stores the state of the pixelui UI
 type UI struct {
-	win        *pixelgl.Window
-	context    *imgui.Context
-	io         imgui.IO
-	fonts      imgui.FontAtlas
-	timer      time.Time
-	fontAtlas  pixel.TargetPicture
-	shader     *pixelgl.GLShader
-	matrix     pixel.Matrix
-	shaderTris *pixelgl.GLTriangles
-	packer     *packer.Packer
-	lastID     int32
-	fontId     int
+	win              *pixelgl.Window
+	context          *imgui.Context
+	io               imgui.IO
+	fonts            imgui.FontAtlas
+	timer            time.Time
+	fontAtlas        pixel.TargetPicture
+	shader           *pixelgl.GLShader
+	matrix           pixel.Matrix
+	shaderTris       *pixelgl.GLTriangles
+	packer           *packer.Packer
+	lastAtlasId      int32
+	lastPictureId    int32
+	fontId           int
+	pictureNames     map[int]string
+	pictureDrawables map[string]*renderSource
 }
 
 var CurrentUI *UI
 
+type renderSource struct {
+	nTris      int
+	picture    pixel.Picture
+	shaderTris *pixelgl.GLTriangles
+}
+
+const (
+	ATLAS_DRAWABLE_KEY       = "atlas"
+	PICTURE_TEXTUREID_OFFSET = 2 ^ 30
+)
+
 // pixelui.NewUI flags:
+//
 //	NO_DEFAULT_FONT: Do not load the default font during NewUI.
 const (
 	NO_DEFAULT_FONT uint8 = 1 << iota
@@ -92,6 +107,10 @@ func NewUI(win *pixelgl.Window, flags uint8) *UI {
 	ui.shader = pixelgl.NewGLShader(uiShader)
 
 	ui.shaderTris = pixelgl.NewGLTriangles(ui.shader, pixel.MakeTrianglesData(0))
+	ui.pictureNames = make(map[int]string)
+	ui.pictureDrawables = make(map[string]*renderSource)
+	ui.lastAtlasId = 0
+	ui.lastPictureId = 0
 
 	if flags&NO_DEFAULT_FONT == 0 {
 		ui.loadDefaultFont()
@@ -145,10 +164,8 @@ func (ui *UI) Draw(win *pixelgl.Window) {
 	imgui.Render()
 	data := imgui.RenderedDrawData()
 
-	// Since we have to redraw all of the triangles every frame,
-	//	only resize the triangles list when we need to, and truncate
-	//	it right before we draw (to get rid of any extra triangles).
-	totalTris := 0
+	atlasDrawable := ui.initAtlasDrawable()
+	atlasDrawable.nTris = 0
 
 	// In each command, there is a vertex buffer that holds all of the vertices to draw;
 	// 	there's also an index buffer which stores the indices into the vertex buffer that should
@@ -164,12 +181,21 @@ func (ui *UI) Draw(win *pixelgl.Window) {
 			if cmd.HasUserCallback() {
 				cmd.CallUserCallback(cmds)
 			} else {
+				id := int(cmd.TextureID())
+				var drawable *renderSource
+				drawFromAtlas := isAtlasId(id)
+				if drawFromAtlas {
+					drawable = atlasDrawable
+				} else {
+					idx := id - PICTURE_TEXTUREID_OFFSET
+					drawable = ui.pictureDrawables[ui.pictureNames[idx]]
+				}
 				count := cmd.ElementCount()
-				iStart := totalTris
-				totalTris += count
+				iStart := drawable.nTris
+				drawable.nTris += count
 
-				if ui.shaderTris.Len() < totalTris {
-					ui.shaderTris.SetLen(totalTris)
+				if drawable.shaderTris.Len() < drawable.nTris {
+					drawable.shaderTris.SetLen(drawable.nTris)
 				}
 
 				clipRect := imguiRectToPixelRect(cmd.ClipRect()).Norm()
@@ -177,8 +203,12 @@ func (ui *UI) Draw(win *pixelgl.Window) {
 				clipRect.Max = ui.matrix.Project(clipRect.Max)
 				clipRect = clipRect.Norm()
 
-				id := int(cmd.TextureID())
-				texRect := ui.packer.BoundsOf(id)
+				var texRect pixel.Rect
+				if drawFromAtlas {
+					texRect = ui.packer.BoundsOf(id)
+				} else {
+					texRect = drawable.picture.Bounds()
+				}
 
 				intensity := 0.0
 				if id != ui.fontId {
@@ -195,21 +225,29 @@ func (ui *UI) Draw(win *pixelgl.Window) {
 
 					position := PV(*pos)
 					color := imguiColorToPixelColor(*col)
-					uuvv := ui.calcData(texRect, PV(*uv))
+					uuvv := calcData(texRect, PV(*uv), drawable.picture)
 
-					ui.shaderTris.SetPosition(iStart+i, position)
-					ui.shaderTris.SetPicture(iStart+i, uuvv, intensity)
-					ui.shaderTris.SetColor(iStart+i, pixel.ToRGBA(color))
-					ui.shaderTris.SetClipRect(iStart+i, clipRect)
+					drawable.shaderTris.SetPosition(iStart+i, position)
+					drawable.shaderTris.SetPicture(iStart+i, uuvv, intensity)
+					drawable.shaderTris.SetColor(iStart+i, pixel.ToRGBA(color))
+					drawable.shaderTris.SetClipRect(iStart+i, clipRect)
 					indexBufferOffset += uintptr(indexSize)
 				}
 			}
 		}
 	}
 
-	ui.shaderTris.SetLen(totalTris)
-	ui.shaderTris.CopyVertices()
-	win.MakePicture(ui.packer.Picture()).Draw(win.MakeTriangles(ui.shaderTris))
+	atlasDrawable.shaderTris.SetLen(atlasDrawable.nTris)
+	atlasDrawable.shaderTris.CopyVertices()
+	win.MakePicture(atlasDrawable.picture).Draw(win.MakeTriangles(atlasDrawable.shaderTris))
+
+	for _, drawable := range ui.pictureDrawables {
+		if drawable != nil && drawable != atlasDrawable {
+			drawable.shaderTris.SetLen(drawable.nTris)
+			drawable.shaderTris.CopyVertices()
+			win.MakePicture(drawable.picture).Draw(win.MakeTriangles(drawable.shaderTris))
+		}
+	}
 
 	win.SetMatrix(pixel.IM)
 }
@@ -219,9 +257,20 @@ func recip(m float64) float64 {
 	return 1 / m
 }
 
+func (ui *UI) initAtlasDrawable() *renderSource {
+	if _, found := ui.pictureDrawables[ATLAS_DRAWABLE_KEY]; !found {
+		atlasDrawable := &renderSource{
+			picture:    ui.packer.Picture(),
+			shaderTris: ui.shaderTris,
+		}
+		ui.pictureDrawables[ATLAS_DRAWABLE_KEY] = atlasDrawable
+	}
+	return ui.pictureDrawables[ATLAS_DRAWABLE_KEY]
+}
+
 // calcData scales the incoming sprite uv to the proper sub-sprite in the packed atlas.
-func (ui *UI) calcData(frame pixel.Rect, uuvv pixel.Vec) (pic pixel.Vec) {
-	return uuvv.ScaledXY(frame.Size()).Add(frame.Min).ScaledXY(ui.packer.Bounds().Size().Map(recip))
+func calcData(frame pixel.Rect, uuvv pixel.Vec, picture pixel.Picture) (pic pixel.Vec) {
+	return uuvv.ScaledXY(frame.Size()).Add(frame.Min).ScaledXY(picture.Bounds().Size().Map(recip))
 }
 
 // imguiColorToPixelColor Converts the imgui color to a Pixel color.
@@ -233,4 +282,8 @@ func imguiColorToPixelColor(c uint32) color.RGBA {
 		G: uint8((c >> 8) & 0xFF),
 		R: uint8(c & 0xFF),
 	}
+}
+
+func isAtlasId(id int) bool {
+	return id < 2^30
 }

@@ -32,8 +32,8 @@ func Sprite(sprite *pixel.Sprite) imgui.TextureID {
 	}))
 }
 
-func (ui *UI) nextID() int {
-	return int(atomic.AddInt32(&ui.lastID, 1))
+func (ui *UI) nextSpriteId() int {
+	return int(atomic.AddInt32(&ui.lastAtlasId, 1))
 }
 
 func (ui *UI) AddSprite(name string, sprite *pixel.Sprite) imgui.TextureID {
@@ -47,7 +47,7 @@ func (ui *UI) AddSprite(name string, sprite *pixel.Sprite) imgui.TextureID {
 			i++
 		}
 	}
-	id := ui.nextID()
+	id := ui.nextSpriteId()
 	ui.packer.Insert(id, newPic.Image())
 	return imgui.TextureID(id)
 }
